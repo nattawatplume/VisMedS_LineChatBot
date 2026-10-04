@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+line-bot-sdk>=3.0
+httpx>=0.27
+pydantic-settings>=2.2
+pillow>=10.0
+numpy>=1.26
+ai-edge-litert>=1.0
