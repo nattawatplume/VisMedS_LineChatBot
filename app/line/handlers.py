@@ -6,7 +6,7 @@ import logging
 from urllib.parse import parse_qs, urlencode
 
 from linebot.v3.messaging import (
-    AsyncMessagingApi, AsyncMessagingApiBlob, PostbackAction, QuickReply,
+    AsyncMessagingApi, AsyncMessagingApiBlob, PostbackAction, PushMessageRequest, QuickReply,
     QuickReplyItem, ReplyMessageRequest, ShowLoadingAnimationRequest, TextMessage,
 )
 from linebot.v3.webhooks import (
@@ -56,11 +56,38 @@ class BotHandlers:
         self.llm, self.sessions = llm, sessions
 
     # ---------- utilities ----------
-    async def _reply(self, token: str, *texts: str, quick_reply: QuickReply | None = None):
+    async def _reply(self, target: any, *texts: str,
+                     quick_reply: QuickReply | None = None,
+                     user_id: str | None = None):
         msgs = [TextMessage(text=t[:5000]) for t in texts][:5]
         if quick_reply is not None:
             msgs[-1].quick_reply = quick_reply
-        await self.api.reply_message(ReplyMessageRequest(reply_token=token, messages=msgs))
+
+        token = None
+        uid = user_id
+
+        if isinstance(target, str):
+            token = target
+        elif target is not None:
+            token = getattr(target, "reply_token", None)
+            if not uid and hasattr(target, "source"):
+                uid = getattr(target.source, "user_id", None)
+
+        if token:
+            try:
+                await self.api.reply_message(ReplyMessageRequest(reply_token=token, messages=msgs))
+                return
+            except Exception:
+                log.warning("reply_message failed (token might be expired or invalid), attempting push fallback", exc_info=True)
+
+        if uid:
+            log.info("Sending push_message fallback to %s", uid)
+            try:
+                await self.api.push_message(PushMessageRequest(to=uid, messages=msgs))
+            except Exception:
+                log.exception("push_message fallback failed")
+        else:
+            log.error("Cannot reply or push: no valid reply_token or user_id")
 
     async def _loading(self, user_id: str | None, seconds: int = 10):
         if not user_id:
@@ -75,24 +102,22 @@ class BotHandlers:
     async def dispatch(self, event) -> None:
         try:
             if isinstance(event, FollowEvent):
-                await self._reply(event.reply_token, WELCOME)
+                await self._reply(event, WELCOME)
             elif isinstance(event, MessageEvent):
                 if isinstance(event.message, TextMessageContent):
                     await self.on_text(event)
                 elif isinstance(event.message, ImageMessageContent):
                     await self.on_image(event)
                 else:
-                    await self._reply(event.reply_token, "ตอนนี้รับได้เฉพาะข้อความและรูปภาพค่ะ")
+                    await self._reply(event, "ตอนนี้รับได้เฉพาะข้อความและรูปภาพค่ะ")
             elif isinstance(event, PostbackEvent):
                 await self.on_postback(event)
         except Exception:  # noqa: BLE001
             log.exception("handler failed")
-            token = getattr(event, "reply_token", None)
-            if token:
-                try:
-                    await self._reply(token, "ขออภัยค่ะ ระบบขัดข้อง ลองใหม่อีกครั้งนะคะ")
-                except Exception:  # noqa: BLE001
-                    log.exception("fallback reply failed")
+            try:
+                await self._reply(event, "ขออภัยค่ะ ระบบขัดข้อง ลองใหม่อีกครั้งนะคะ")
+            except Exception:  # noqa: BLE001
+                log.exception("fallback reply failed")
 
     # ---------- text ----------
     async def on_text(self, event: MessageEvent) -> None:
@@ -100,19 +125,19 @@ class BotHandlers:
         user_id = event.source.user_id if event.source else None
 
         if (urgent := guardrails.check_emergency(text)) is not None:
-            await self._reply(event.reply_token, urgent)
+            await self._reply(event, urgent, user_id=user_id)
             return
         if text in ("ยาที่รู้จัก", "รายชื่อยา", "help", "ช่วยเหลือ", "วิธีใช้"):
             names = "\n".join(f"• {d.name_th}" for d in self.drugs.all())
-            await self._reply(event.reply_token, f"ตอนนี้รู้จักยาเหล่านี้ค่ะ\n{names}\n\n"
-                                                 "ส่งรูปยามาให้ดู หรือพิมพ์ถามได้เลยค่ะ")
+            await self._reply(event, f"ตอนนี้รู้จักยาเหล่านี้ค่ะ\n{names}\n\n"
+                                     "ส่งรูปยามาให้ดู หรือพิมพ์ถามได้เลยค่ะ", user_id=user_id)
             return
 
         await self._loading(user_id, 20)
         sess = self.sessions.get(user_id or "anon")
         answer = await self.llm.reply(sess.history, text, sess.current_drug_id)
         self.sessions.add_turn(user_id or "anon", text, answer)
-        await self._reply(event.reply_token, answer)
+        await self._reply(event, answer, user_id=user_id)
 
     # ---------- image ----------
     async def on_image(self, event: MessageEvent) -> None:
@@ -127,16 +152,17 @@ class BotHandlers:
 
         drug = self.drugs.by_label(pred.label) if pred.is_confident else None
         if drug is None:
-            await self._reply(event.reply_token, PHOTO_TIPS)
+            await self._reply(event, PHOTO_TIPS, user_id=user_id)
             return
 
         self.sessions.get(user_id or "anon").pending_drug_id = drug.id
         await self._reply(
-            event.reply_token,
+            event,
             f"ดูเหมือนจะเป็น \"{drug.name_th}\" ใช่ไหมคะ?\n"
             "(ช่วยเทียบชื่อกับฉลากบนกล่องอีกครั้งนะคะ)",
             quick_reply=_quick(("ใช่", {"a": "yes", "d": drug.id}),
                                ("ไม่ใช่", {"a": "no"})),
+            user_id=user_id,
         )
 
     # ---------- postback ----------
@@ -148,13 +174,15 @@ class BotHandlers:
         if data.get("a") == "yes":
             drug = self.drugs.get(data.get("d", ""))
             if drug is None:
-                await self._reply(event.reply_token, PHOTO_TIPS)
+                await self._reply(event, PHOTO_TIPS, user_id=user_id)
                 return
             sess.current_drug_id, sess.pending_drug_id = drug.id, None
-            await self._reply(event.reply_token, self.drugs.format_reply(drug),
-                              "มีอะไรอยากถามเพิ่มเกี่ยวกับยานี้ พิมพ์ถามได้เลยค่ะ")
+            await self._reply(event, self.drugs.format_reply(drug),
+                              "มีอะไรอยากถามเพิ่มเกี่ยวกับยานี้ พิมพ์ถามได้เลยค่ะ",
+                              user_id=user_id)
         elif data.get("a") == "no":
             sess.pending_drug_id = None
-            await self._reply(event.reply_token,
+            await self._reply(event,
                               "ขออภัยค่ะ ลองถ่ายรูปใหม่ให้เห็นชื่อยาชัด ๆ "
-                              "หรือพิมพ์ชื่อยามาถามได้เลยค่ะ")
+                              "หรือพิมพ์ชื่อยามาถามได้เลยค่ะ",
+                              user_id=user_id)
