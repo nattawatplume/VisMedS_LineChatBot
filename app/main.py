@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from linebot.v3 import WebhookParser
 from linebot.v3.messaging import (
     AsyncApiClient, AsyncMessagingApi, AsyncMessagingApiBlob, Configuration,
@@ -34,16 +35,24 @@ async def lifespan(app: FastAPI):
         drugs=drugs,
         llm=llm,
         sessions=SessionStore(s.session_ttl_s, s.session_max_turns),
+        base_url=s.app_base_url,
     )
     yield
     await llm.aclose()
     await api_client.close()
 
 
+s = get_settings()
 app = FastAPI(title="VisMedS", lifespan=lifespan)
 app.include_router(router)
+
+# ให้บริการไฟล์เสียงสำหรับ LINE Audio Message
+audio_path = s.drugs_path.parent / "audio"
+if audio_path.exists():
+    app.mount("/static/audio", StaticFiles(directory=audio_path), name="audio")
 
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+

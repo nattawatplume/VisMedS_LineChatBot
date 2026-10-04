@@ -20,6 +20,13 @@ class Drug:
     verified: bool = False
 
 
+AUDIO_DURATIONS_MS: dict[str, int] = {
+    "sara.mp3": 18000,
+    "thatu-nam-khao.mp3": 20400,
+    "tylenol.mp3": 20000,
+}
+
+
 class DrugRepository:
     def __init__(self, path: Path):
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -36,10 +43,18 @@ class DrugRepository:
     def by_label(self, label: str) -> Drug | None:
         return self._by_label.get(label)
 
+    def get_audio_info(self, drug: Drug, base_url: str) -> tuple[str, int] | None:
+        if not drug.audio:
+            return None
+        url = f"{base_url.rstrip('/')}/static/audio/{drug.audio}"
+        duration = AUDIO_DURATIONS_MS.get(drug.audio, 18000)
+        return url, duration
+
     # ---- รูปแบบข้อความ ----
     @staticmethod
     def _bullets(items: list[str]) -> str:
         return "\n".join(f"– {i}" for i in items)
+
 
     def format_reply(self, drug: Drug) -> str:
         parts = [

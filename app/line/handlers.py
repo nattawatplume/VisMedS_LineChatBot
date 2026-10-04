@@ -6,8 +6,8 @@ import logging
 from urllib.parse import parse_qs, urlencode
 
 from linebot.v3.messaging import (
-    AsyncMessagingApi, AsyncMessagingApiBlob, PostbackAction, PushMessageRequest, QuickReply,
-    QuickReplyItem, ReplyMessageRequest, ShowLoadingAnimationRequest, TextMessage,
+    AsyncMessagingApi, AsyncMessagingApiBlob, AudioMessage, PostbackAction, PushMessageRequest,
+    QuickReply, QuickReplyItem, ReplyMessageRequest, ShowLoadingAnimationRequest, TextMessage,
 )
 from linebot.v3.webhooks import (
     FollowEvent, ImageMessageContent, MessageEvent, PostbackEvent, TextMessageContent,
@@ -50,18 +50,27 @@ def _quick(*pairs: tuple[str, dict]) -> QuickReply:
 class BotHandlers:
     def __init__(self, api: AsyncMessagingApi, blob: AsyncMessagingApiBlob,
                  classifier: DrugClassifier, drugs: DrugRepository,
-                 llm: LLMClient, sessions: SessionStore):
+                 llm: LLMClient, sessions: SessionStore,
+                 base_url: str = "https://vismeds-bot.onrender.com"):
         self.api, self.blob = api, blob
         self.classifier, self.drugs = classifier, drugs
         self.llm, self.sessions = llm, sessions
+        self.base_url = base_url
 
     # ---------- utilities ----------
-    async def _reply(self, target: any, *texts: str,
+    async def _reply(self, target: any, *items: any,
                      quick_reply: QuickReply | None = None,
                      user_id: str | None = None):
-        msgs = [TextMessage(text=t[:5000]) for t in texts][:5]
-        if quick_reply is not None:
+        msgs = []
+        for item in items:
+            if isinstance(item, str):
+                msgs.append(TextMessage(text=item[:5000]))
+            else:
+                msgs.append(item)
+        msgs = msgs[:5]
+        if quick_reply is not None and msgs:
             msgs[-1].quick_reply = quick_reply
+
 
         token = None
         uid = user_id
@@ -133,6 +142,43 @@ class BotHandlers:
                                      "ส่งรูปยามาให้ดู หรือพิมพ์ถามได้เลยค่ะ", user_id=user_id)
             return
 
+        # ผู้ใช้ขอฟังเสียงแนะนำการใช้ยา
+        if text in ("ฟังเสียง", "เปิดเสียง", "ขอเสียง", "เล่นเสียง", "ฟังเสียงยา"):
+            sess = self.sessions.get(user_id or "anon")
+            drug = self.drugs.get(sess.current_drug_id) if sess.current_drug_id else None
+            if drug and (audio_info := self.drugs.get_audio_info(drug, self.base_url)):
+                audio_url, duration_ms = audio_info
+                await self._reply(
+                    event,
+                    f"🔊 เสียงแนะนำวิธีใช้: {drug.name_th}",
+                    AudioMessage(original_content_url=audio_url, duration=duration_ms),
+                    user_id=user_id,
+                )
+                return
+            await self._reply(event, "ยังไม่ได้เลือกยาค่ะ ส่งรูปยาหรือบอกชื่อยาก่อนนะคะ เช่น พิมพ์ \"ซาร่า\" แล้วกดขอฟังเสียงได้ค่ะ", user_id=user_id)
+            return
+
+        # ถ้าผู้ใช้พิมพ์ชื่อยาที่รู้จักตรงๆ ให้ตอบข้อมูลยาพร้อมเสียงทันที
+        matched_drug = next((d for d in self.drugs.all() if text.lower() in (d.name_th.lower(), d.id.lower(), d.model_label.lower())), None)
+        if matched_drug:
+            sess = self.sessions.get(user_id or "anon")
+            sess.current_drug_id = matched_drug.id
+            reply_items = [self.drugs.format_reply(matched_drug)]
+            if audio_info := self.drugs.get_audio_info(matched_drug, self.base_url):
+                audio_url, duration_ms = audio_info
+                reply_items.append(AudioMessage(original_content_url=audio_url, duration=duration_ms))
+            reply_items.append("🔊 ส่งไฟล์เสียงแนะนำวิธีใช้ให้แล้วค่ะ กดฟังได้เลยนะคะ\nมีอะไรอยากถามเพิ่มเกี่ยวกับยานี้ พิมพ์ถามได้เลยค่ะ")
+            await self._reply(
+                event,
+                *reply_items,
+                quick_reply=_quick(
+                    ("🔊 ฟังเสียงอีกครั้ง", {"a": "audio", "d": matched_drug.id}),
+                    ("💊 ยาที่รู้จัก", {"a": "list"}),
+                ),
+                user_id=user_id,
+            )
+            return
+
         await self._loading(user_id, 20)
         sess = self.sessions.get(user_id or "anon")
         answer = await self.llm.reply(sess.history, text, sess.current_drug_id)
@@ -177,9 +223,40 @@ class BotHandlers:
                 await self._reply(event, PHOTO_TIPS, user_id=user_id)
                 return
             sess.current_drug_id, sess.pending_drug_id = drug.id, None
-            await self._reply(event, self.drugs.format_reply(drug),
-                              "มีอะไรอยากถามเพิ่มเกี่ยวกับยานี้ พิมพ์ถามได้เลยค่ะ",
-                              user_id=user_id)
+            reply_items = [self.drugs.format_reply(drug)]
+            
+            # ส่งเสียงวิธีใช้ยาด้วย
+            if audio_info := self.drugs.get_audio_info(drug, self.base_url):
+                audio_url, duration_ms = audio_info
+                reply_items.append(AudioMessage(original_content_url=audio_url, duration=duration_ms))
+            
+            reply_items.append("🔊 ส่งไฟล์เสียงแนะนำวิธีใช้ให้แล้วค่ะ กดฟังได้เลยนะคะ\nมีอะไรอยากถามเพิ่มเกี่ยวกับยานี้ พิมพ์ถามได้เลยค่ะ")
+            await self._reply(
+                event,
+                *reply_items,
+                quick_reply=_quick(
+                    ("🔊 ฟังเสียงอีกครั้ง", {"a": "audio", "d": drug.id}),
+                    ("💊 ยาที่รู้จัก", {"a": "list"}),
+                ),
+                user_id=user_id,
+            )
+        elif data.get("a") == "audio":
+            drug = self.drugs.get(data.get("d", ""))
+            if drug and (audio_info := self.drugs.get_audio_info(drug, self.base_url)):
+                audio_url, duration_ms = audio_info
+                await self._reply(
+                    event,
+                    f"🔊 เสียงแนะนำวิธีใช้: {drug.name_th}",
+                    AudioMessage(original_content_url=audio_url, duration=duration_ms),
+                    user_id=user_id,
+                )
+        elif data.get("a") == "list":
+            names = "\n".join(f"• {d.name_th}" for d in self.drugs.all())
+            await self._reply(
+                event,
+                f"ตอนนี้รู้จักยาเหล่านี้ค่ะ\n{names}\n\nส่งรูปยามาให้ดู หรือพิมพ์ถามได้เลยค่ะ",
+                user_id=user_id,
+            )
         elif data.get("a") == "no":
             sess.pending_drug_id = None
             await self._reply(event,

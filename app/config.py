@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # LINE (ได้จาก LINE Developers Console > Messaging API channel)
     line_channel_secret: str = ""
     line_channel_access_token: str = ""
+    app_base_url: str = "https://vismeds-bot.onrender.com"
 
     # LLM — ค่าเริ่มต้น: Typhoon (โมเดลไทย ฟรี ใช้ผ่าน OpenAI-compatible API)
     # เปลี่ยนเจ้าอื่นได้แค่แก้ LLM_BASE_URL / LLM_MODEL / LLM_API_KEY ใน .env
